@@ -1,63 +1,74 @@
-use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{
-    Router,
-    extract::Extension,
-    response::IntoResponse,
-    routing::{get},
-};
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use reqwest::Error;
+// scraper is a library for web scraping, Html and Selector are used to parse HTML and select elements from it
+use scraper::{Html, Selector}; 
+// task needs for asynced multithreading 
+use tokio::task; 
 
-struct Query;
-
-// 1. Описываем наш объект.
-// #[Object] делает структуру видимой для GraphQL.
-#[Object]
-impl Query {
-    async fn hello(&self) -> &str {
-        "Привет! Это твой первый GraphQL запрос на Rust!"
-    }
-
-    async fn howdy(&self, name: String) -> String {
-        format!("Привет, {}! Как дела в Rust мире?", name)
-    }
+// 
+#[derive(Debug)]
+struct ParseData {
+    titles: Vec<String>,
+    links: Vec<String>,
 }
 
-// Тип для нашей схемы (у нас пока нет мутаций и подписок)
-type MySchema = Schema<Query, EmptyMutation, EmptySubscription>;
-
-// 2. Обработчик для POST запросов
-// async fn graphql_handler(schema: axum::Extension<MySchema>, req: GraphQLRequest)-> GraphQLResponse {
-//     schema.execute(req.into_inner()).await.into()
-// }
-
-async fn graphql_handler(schema: Extension<MySchema>, req: GraphQLRequest) -> GraphQLResponse {
-    schema.execute(req.into_inner()).await.into()
+async fn fetch_html(url: &str) -> Result<String, Error> {
+    // make a GET request to the URL and await the response
+    let response = reqwest::get(url).await?;
+    // if the request is successful, we get the response body as text and return it
+    let body = response.text().await?;
+    // return the body of the response as a String
+    Ok(body)
 }
 
-// 3. Обработчик для GraphiQL (интерфейс в браузере)
-async fn graphiql() -> impl IntoResponse {
-    axum::response::Html(
-        async_graphql::http::GraphiQLSource::build()
-            .endpoint("/")
-            .finish(),
-    )
+fn parse_html(html: &str) -> ParseData {
+    // create a new Html object from the HTML string
+    let document = Html::parse_document(html);
+    // create a Selector to select all <h1>, <h2>, and <h3> elements
+    let title_selector = Selector::parse("h1, h2, h3").unwrap();
+    // create a Selector to select all <a> elements
+    let links_selector = Selector::parse("a").unwrap();
+    
+    let titles = document.select(&title_selector)
+        .map(|element| element.text().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<String>>();
+
+        let links = document.select(&links_selector)
+        .filter_map(|element| element.value().attr("href"))
+        .map(String::from)
+        .collect::<Vec<String>>();
+
+        ParseData { titles, links }
+}
+
+async fn process_urls(urls: Vec<String>) {
+    let mut tasks = Vec::new();
+
+    for url in urls {
+        let task = task::spawn(async move {
+            match fetch_html(&url.clone()).await {
+                Ok(html) => {
+                    let data = parse_html(&html);
+                    println!("Data from {}, titles: {:?}, links: {:?}", url, data.titles, data.links);
+                }
+                Err(e) => eprintln!("Error fetching {}: {}", url, e)
+            }
+        });
+        tasks.push(task);
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    // Создаем схему данных
-    let schema: Schema<Query, EmptyMutation, EmptySubscription> =
-        Schema::build(Query, EmptyMutation, EmptySubscription).finish();
+    let urls = vec![
+        "https://www.rust-lang.org/".to_string(),
+        // "https://www.mozilla.org/".to_string(),
+        // "https://www.wikipedia.org/".to_string(),
+        // "https://www.google.com/".to_string(),
+    ];
 
-    let app = Router::new()
-        .route("/", get(graphiql).post(graphql_handler))
-        .layer(axum::Extension(schema)); // Прокидываем схему в обработчики
-    let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    println!("Сервер запущен на http://{}", addr);
-
-    let listener: TcpListener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    process_urls(urls).await;
 }
-
